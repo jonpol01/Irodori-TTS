@@ -105,10 +105,10 @@ torch.onnx.export(
     dit, (xt, t, ts_ref, tmask, cs_ref, cmask), "/tmp/irodori_dit.onnx",
     input_names=["x_t", "t", "text_state", "text_mask", "caption_state", "caption_mask"],
     output_names=["v"],
-    dynamic_axes={"x_t": {1: "S"}, "text_state": {1: "Tt"}, "text_mask": {1: "Tt"},
-                  "caption_state": {1: "Tc"}, "caption_mask": {1: "Tc"}, "v": {1: "S"}},
+    dynamic_axes={"x_t": {0: "B", 1: "S"}, "t": {0: "B"}, "text_state": {0: "B", 1: "Tt"}, "text_mask": {0: "B", 1: "Tt"},
+                  "caption_state": {0: "B", 1: "Tc"}, "caption_mask": {0: "B", 1: "Tc"}, "v": {0: "B", 1: "S"}},
     opset_version=17, dynamo=False)
-print("[onnx] dit exported")
+print("[onnx] dit exported (dynamic batch for batched CFG)")
 
 # ---- parity ----
 import onnxruntime as ort  # noqa
