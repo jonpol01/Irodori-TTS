@@ -2,7 +2,8 @@
 
 Packages (written to $COREML_OUT, default ./coreml_v4):
   irodori4_encoder.mlpackage   ModernBERT-ja + text/caption projectors.  input_ids (1,L) int32, length (1,) int32
-                               → text_state, caption_state (1,L,512).  L ∈ TEXT_BUCKETS (enumerated).
+                               → text_state, caption_state (1,L,512).  Multifunction, one static function "L{L}"
+                               per L ∈ TEXT_BUCKETS (the enumerated-shape build failed every predict).
   irodori4_duration.mlpackage  text_state (1,L,512), text_len, caption_state (1,CAP_LEN,512), caption_len,
                                duration_features (1,14) → log_frames (1,).
   irodori4_dit.mlpackage       one MeanFlow step: x_t (1,S,32), t, delta_t, latent_len, text_state (1,DIT_T,512),
@@ -70,9 +71,10 @@ def _rotate_half(x):
 class EncoderCM(nn.Module):
     """ModernBERT forward rewritten with explicit additive masks (HF's mask builders do not trace)."""
 
-    def __init__(self, m, max_len=max(TEXT_BUCKETS)):
+    def __init__(self, m, max_len=max(TEXT_BUCKETS), L=None):
         super().__init__()
         self.m = m
+        self.L = L  # static length for conversion: coremltools mis-casts dims read back from a fixed shape
         bb = m.pretrained_text_backbone.backbone
         cfg = bb.config
         self.bb = bb
@@ -98,7 +100,7 @@ class EncoderCM(nn.Module):
         return safe_rms(y * mask, norm.weight, norm.eps)
 
     def forward(self, input_ids, length):
-        L = input_ids.shape[1]
+        L = self.L or input_ids.shape[1]
         idx = torch.arange(L, dtype=torch.int32)
         valid = idx < length
         full_bias = torch.where(valid, 0.0, NEG)[None, None, None, :]
@@ -300,12 +302,40 @@ def export_encoder(rt):
         ts, cs = enc(pad.int(), torch.tensor([n], dtype=torch.int32))
     _cmp("encoder wrapper text (n=150 > window)", ts[0, :n], ref_ts)
     _cmp("encoder wrapper caption", cs[0, :n], ref_cs)
-    ex = (torch.ones(1, 64, dtype=torch.int32), torch.tensor([40], dtype=torch.int32))
-    with torch.no_grad():
-        tr = torch.jit.trace(enc, ex, check_trace=False)
-    _convert(tr, [ct.TensorType("input_ids", shape=ct.EnumeratedShapes([(1, b) for b in TEXT_BUCKETS], default=(1, 64)), dtype=np.int32),
-                  ct.TensorType("length", shape=(1,), dtype=np.int32)],
-             [ct.TensorType("text_state"), ct.TensorType("caption_state")], "encoder")
+    # Static multifunction like the DiT: the EnumeratedShapes build converted, but every predict failed with
+    # error -7 on CPU, GPU and ANE alike.
+    fns = []
+    for L in TEXT_BUCKETS:
+        ex = (torch.ones(1, L, dtype=torch.int32), torch.tensor([L - 3], dtype=torch.int32))
+        with torch.no_grad():
+            tr = torch.jit.trace(EncoderCM(m, L=L).eval(), ex, check_trace=False)
+        mlm = ct.convert(
+            tr, inputs=[ct.TensorType("input_ids", shape=(1, L), dtype=np.int32),
+                        ct.TensorType("length", shape=(1,), dtype=np.int32)],
+            outputs=[ct.TensorType("text_state"), ct.TensorType("caption_state")], convert_to="mlprogram",
+            minimum_deployment_target=ct.target.iOS18, compute_precision=ct.precision.FLOAT16)
+        fns.append((f"L{L}", mlm))
+    _save_multifunction(fns, "encoder", "L64")
+
+
+def _save_multifunction(fns, name, default):
+    """[(function_name, MLModel)] → one multifunction package with deduplicated weights."""
+    import shutil
+
+    ct = _ct()
+    desc = ct.utils.MultiFunctionDescriptor()
+    tmp = []
+    for fn, mlm in fns:
+        p = os.path.join(OUT, f"_tmp_{name}_{fn}.mlpackage")
+        mlm.save(p)
+        tmp.append(p)
+        desc.add_function(p, src_function_name="main", target_function_name=fn)
+    desc.default_function_name = default
+    path = os.path.join(OUT, NAMES[name])
+    ct.utils.save_multifunction(desc, path)
+    for p in tmp:
+        shutil.rmtree(p)
+    print(f"[export] {path}", flush=True)
 
 
 def export_duration(rt):
