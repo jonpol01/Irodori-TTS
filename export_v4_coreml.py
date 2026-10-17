@@ -10,7 +10,7 @@ Packages (written to $COREML_OUT, default ./coreml_v4):
                                text_len, caption_state (1,CAP_LEN,512), caption_len → v (1,S,32).
                                Multifunction package, one static-shape function "s{S}" per S ∈ DIT_S, shared
                                weights (enumerated shapes made coremltools' symbolic shape pass blow up).
-  irodori4_decoder.mlpackage   DACVAE decoder chunk: z (1,32,W) → audio (1,1,W*1920).  W ∈ DEC_T, chunked with
+  irodori4_decoder.mlpackage   DACVAE decoder chunk: z (1,32,W) → audio (1,1,W*1920).  W = 128 (static), chunked with
                                DEC_OVERLAP frames of context (receptive field is ±7.1 latent frames).
 
 Masks are built in-graph from lengths so only one input per package varies in shape. The speaker segment is
@@ -33,7 +33,9 @@ TEXT_BUCKETS = (32, 64, 128, 256)  # tokens incl. BOS; 256 = runtime max_text_le
 CAP_LEN = 64
 DIT_S = (64, 128, 192, 256, 384)  # latent frames (25 Hz): 2.6 / 5.1 / 7.7 / 10.2 / 15.4 s
 DIT_T = 128  # a 15 s utterance is ~90 tokens, so 128 covers every DiT bucket
-DEC_T = (64, 128)
+# One static width: the EnumeratedShapes decoder converted and ran on the Mac GPU, but crashed at its first
+# predict on the iPhone 17 Pro GPU. A short final chunk is zero-padded to 128 (it is trimmed afterwards).
+DEC_T = (128,)
 DEC_OVERLAP = 8
 LATENT_DIM, HOP, SR = 32, 1920, 48000
 NEG = -1e4  # additive mask; fp16-safe
@@ -424,7 +426,7 @@ def export_dit(rt):
 def export_decoder(rt):
     ct = _ct()
     torch.manual_seed(0)
-    z = torch.randn(1, LATENT_DIM, 64) * 0.8
+    z = torch.randn(1, LATENT_DIM, DEC_T[-1]) * 0.8
     with torch.no_grad():
         ref = rt.codec.decode_latent(z.transpose(1, 2))  # before the snake patch / weight-norm removal
     dec = DecoderCM(rt.codec.model).eval()
@@ -434,8 +436,7 @@ def export_decoder(rt):
     assert rel < 1e-5
     with torch.no_grad():
         tr = torch.jit.trace(dec, (z,), check_trace=False)
-    _convert(tr, [ct.TensorType("z", shape=ct.EnumeratedShapes([(1, LATENT_DIM, w) for w in DEC_T], default=(1, LATENT_DIM, 64)))],
-             [ct.TensorType("audio")], "decoder")
+    _convert(tr, [ct.TensorType("z", shape=(1, LATENT_DIM, DEC_T[-1]))], [ct.TensorType("audio")], "decoder")
 
 
 if __name__ == "__main__":
